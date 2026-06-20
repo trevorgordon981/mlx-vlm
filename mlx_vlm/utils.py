@@ -550,6 +550,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
+    # Some MLX-format checkpoints still need the model's own ``sanitize`` to run
+    # (e.g. MiniMax-M3, whose MLX-converted weights use checkpoint-native names
+    # for the stacked MoE experts, the Lightning-Indexer projections, and the
+    # flattened vision tower). Such models opt in via ``always_sanitize = True``.
+    # ``sanitize`` is written to be idempotent, so running it here is safe even
+    # if the broader ``not is_mlx_format`` block below would also run it.
+    if is_mlx_format and getattr(model, "always_sanitize", False):
+        weights = sanitize_weights(model, weights)
+
     if not is_mlx_format:
         # Sanitize weights
         weights = sanitize_weights(model, weights)

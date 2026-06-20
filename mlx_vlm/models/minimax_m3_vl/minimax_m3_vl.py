@@ -180,6 +180,14 @@ class MiniMaxProjector(nn.Module):
 
 
 class Model(nn.Module):
+    # MLX-converted M3-VL checkpoints are tagged ``format=mlx`` but still use
+    # checkpoint-native weight names (stacked MoE experts, ``self_attn.indexer.*``
+    # Lightning-Indexer projections, and a flattened ``vision_tower.*`` CLIP
+    # tower). ``load_model`` skips ``sanitize`` for mlx-format checkpoints by
+    # default, so opt in to always run it. ``sanitize`` is idempotent, so a
+    # double-run is safe.
+    always_sanitize = True
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
