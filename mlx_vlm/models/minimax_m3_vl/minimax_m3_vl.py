@@ -1,3 +1,4 @@
+import re
 from typing import Optional
 
 import mlx.core as mx
@@ -455,6 +456,32 @@ class Model(nn.Module):
                 )
             elif key.startswith("model.patch_merge_mlp."):
                 key = key.replace("model.patch_merge_mlp.", "patch_merge_mlp.", 1)
+            # MLX-converted M3-VL checkpoints store the CLIP-style vision tower
+            # FLATTENED under `vision_tower.*` (e.g.
+            # `vision_tower.embeddings.patch_embedding.weight`,
+            # `vision_tower.encoder_layers.N.*`, `vision_tower.pre_layrnorm.*`),
+            # dropping the `vision_model` nesting level and using
+            # `encoder_layers.N` instead of `encoder.layers.N`. The VL model
+            # builds the tower as `vision_tower.vision_model.encoder.layers.N`,
+            # so remap the flattened names onto the nested module names.
+            if key.startswith("vision_tower.") and not key.startswith(
+                "vision_tower.vision_model."
+            ):
+                key = "vision_tower.vision_model." + key[len("vision_tower."):]
+            key = re.sub(
+                r"^vision_tower\.vision_model\.encoder_layers\.",
+                "vision_tower.vision_model.encoder.layers.",
+                key,
+            )
+            # MLX-converted M3 checkpoints store the Lightning-Indexer
+            # projections under a `self_attn.indexer.*` submodule; the language
+            # model builds them as flat `self_attn.index_*` attributes. Remap
+            # to match (scales/biases ride along so the loader quantizes them).
+            key = re.sub(
+                r"self_attn\.indexer\.(q|k)_(proj|norm)",
+                r"self_attn.index_\1_\2",
+                key,
+            )
             sanitized_weights[key] = value
         weights.clear()
 
@@ -473,6 +500,22 @@ class Model(nn.Module):
                 sanitized_weights[key.replace(".weight_scale_inv", ".scales")] = (
                     sanitized_weights.pop(key)
                 )
+
+        # The CLIP-style patch embedding is stored channels-last in the
+        # MLX-converted checkpoint as (hidden, T, H, W, C); the vision module
+        # declares it (hidden, C, T, H, W). Transpose so the conv weight maps
+        # onto the module parameter (load_weights is strict on shape).
+        pe_key = (
+            "vision_tower.vision_model.embeddings.patch_embedding.weight"
+        )
+        pe = sanitized_weights.get(pe_key)
+        if pe is not None and pe.ndim == 5 and pe.shape[1:] == (
+            self.config.vision_config.temporal_patch_size,
+            self.config.vision_config.patch_size,
+            self.config.vision_config.patch_size,
+            self.config.vision_config.num_channels,
+        ):
+            sanitized_weights[pe_key] = mx.transpose(pe, (0, 4, 1, 2, 3))
 
         args = self.language_model.args
         _sanitize_moe_weights(sanitized_weights, args)
