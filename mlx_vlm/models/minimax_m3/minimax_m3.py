@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -84,8 +85,25 @@ class Model(nn.Module):
                 pass
             elif key.startswith("model.") or key.startswith("lm_head."):
                 key = f"language_model.{key}"
+            else:
+                # Text-only model: drop multimodal weights (vision tower,
+                # projector, patch-merge) that this model never instantiates.
+                # mlx load_weights is strict, so leaving them in would raise.
+                continue
             sanitized_weights[key] = value
         weights.clear()
+
+        # MLX-converted M3 checkpoints store the Lightning-Indexer projections
+        # under a `self_attn.indexer.*` submodule; this model builds them as
+        # flat `self_attn.index_*` attributes. Remap names to match.
+        sanitized_weights = {
+            re.sub(
+                r"self_attn\.indexer\.(q|k)_(proj|norm)",
+                r"self_attn.index_\1_\2",
+                key,
+            ): value
+            for key, value in sanitized_weights.items()
+        }
 
         scale_keys = {
             key.replace(".weight_scale_inv", ".weight")

@@ -53,8 +53,64 @@ def _sanitize_moe_weights(weights: dict, args):
     def pop_stack(keys):
         return mx.stack([weights.pop(key) for key in keys])
 
+    def stack_shared(routed, shared, axis):
+        """Append a single shared expert (no expert dim) onto a pre-stacked
+        [E, ...] routed tensor along the leading expert axis."""
+        return mx.concatenate([routed, mx.expand_dims(shared, axis=0)], axis=axis)
+
     for layer_idx in range(args.num_hidden_layers):
         prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+        # The MLX-converted M3 checkpoints (e.g. mlx-community/MiniMax-M3-*bit)
+        # store MoE layers under `mlp.` (not `block_sparse_moe.`) with the routed
+        # experts ALREADY stacked into `switch_mlp.{gate,up,down}_proj` and the
+        # shared expert kept separate under `shared_experts.*`. Detect and remap
+        # that layout to the names/packing this model builds. Dense (non-MoE)
+        # layers keep their `mlp.{gate,up,down}_proj` and are left untouched.
+        stacked = f"language_model.model.layers.{layer_idx}.mlp"
+        if any(
+            k.startswith(f"{stacked}.switch_mlp.") for k in weights
+        ) or f"{stacked}.gate.weight" in weights:
+            # router + routing-bias rename: mlp.gate -> block_sparse_moe.gate
+            for tail in ("gate.weight", "gate.scales", "gate.biases",
+                         "e_score_correction_bias"):
+                src_key = f"{stacked}.{tail}"
+                if src_key in weights:
+                    weights[f"{prefix}.{tail}"] = weights.pop(src_key)
+
+            for suffix in ("weight", "scales", "biases", "bias"):
+                sg = f"{stacked}.switch_mlp.gate_proj.{suffix}"
+                su = f"{stacked}.switch_mlp.up_proj.{suffix}"
+                sd = f"{stacked}.switch_mlp.down_proj.{suffix}"
+                shg = f"{stacked}.shared_experts.gate_proj.{suffix}"
+                shu = f"{stacked}.shared_experts.up_proj.{suffix}"
+                shd = f"{stacked}.shared_experts.down_proj.{suffix}"
+                if pack_shared:
+                    if sg in weights and su in weights and shg in weights and shu in weights:
+                        gate = weights.pop(sg)
+                        up = weights.pop(su)
+                        shared_gate = weights.pop(shg)
+                        shared_up = weights.pop(shu)
+                        # concat gate|up along the output-feature axis (axis=1 for
+                        # the [E, out, in] stacked tensors), then append shared.
+                        routed_gate_up = mx.concatenate([gate, up], axis=1)
+                        shared_gate_up = mx.concatenate([shared_gate, shared_up], axis=0)
+                        weights[f"{prefix}.switch_mlp.gate_up_proj.{suffix}"] = (
+                            stack_shared(routed_gate_up, shared_gate_up, axis=0)
+                        )
+                    if sd in weights and shd in weights:
+                        down = weights.pop(sd)
+                        shared_down = weights.pop(shd)
+                        weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                            stack_shared(down, shared_down, axis=0)
+                        )
+                else:
+                    for src_key, mlx_name in ((sg, "gate_proj"), (su, "up_proj"), (sd, "down_proj")):
+                        if src_key in weights:
+                            weights[f"{prefix}.switch_mlp.{mlx_name}.{suffix}"] = weights.pop(src_key)
+                    for src_key, mlx_name in ((shg, "gate_proj"), (shu, "up_proj"), (shd, "down_proj")):
+                        if src_key in weights:
+                            weights[f"{prefix}.shared_experts.{mlx_name}.{suffix}"] = weights.pop(src_key)
+            continue
 
         for suffix in ("weight", "scales", "biases", "bias"):
             if pack_shared:
