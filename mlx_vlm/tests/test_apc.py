@@ -1169,3 +1169,37 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def test_exact_cache_supports_quantized_kv_cache():
+    """APC must clone+restore QuantizedKVCache (the --kv-bits layers). Before #1174 these were
+    silently skipped, so prefix caching was inert whenever KV-quant was enabled."""
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    block_size = 16
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    token_ids = list(range(48))
+
+    kv = KVCache()
+    kv.keys = mx.arange(1 * 1 * len(token_ids) * 64, dtype=mx.float32).reshape(
+        1, 1, len(token_ids), 64
+    )
+    kv.values = kv.keys + 7.0
+    kv.offset = len(token_ids)
+    quant = kv.to_quantized(group_size=64, bits=8)
+    mx.eval(*quant.keys, *quant.values)
+
+    assert manager.store_exact_cache(token_ids, [quant], extra_hash=21)
+    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=21)
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert isinstance(warm[0], QuantizedKVCache)
+    assert warm[0] is not quant  # decoupled copy
+    assert warm[0].offset == quant.offset
+    assert warm[0].bits == quant.bits
+    assert warm[0].group_size == quant.group_size
+    # the (packed, scales, biases) trio round-trips exactly
+    for side_w, side_q in zip(warm[0].state, quant.state):
+        for aw, aq in zip(side_w, side_q):
+            _assert_allclose(aw.astype(mx.float32), aq.astype(mx.float32))

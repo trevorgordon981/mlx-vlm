@@ -154,6 +154,27 @@ def _clone_cache_entry_for_apc(
             eval_targets.extend([keys, values])
         return out
 
+    if isinstance(c, lm_cache.QuantizedKVCache):
+        # Quantized KV layers (created once --kv-bits is set) were silently skipped by every
+        # APC path, making prefix caching fully inert with KV-quant on (#1174). Clone via the
+        # cache's own (.state / .meta_state) round-trip so the (packed, scales, biases) trio is
+        # handled generically -- the same mechanism mlx_lm uses to reuse quantized prompt cache.
+        off = int(getattr(c, "offset", 0) or 0)
+        if c.keys is None or off <= 0:
+            out = lm_cache.QuantizedKVCache(
+                group_size=int(getattr(c, "group_size", 64)),
+                bits=int(getattr(c, "bits", 8)),
+            )
+            out.offset = off
+            return out
+        copied_state = tuple(
+            tuple(_copy_mlx_array(a) for a in side) for side in c.state
+        )
+        out = lm_cache.QuantizedKVCache.from_state(copied_state, c.meta_state)
+        for side in copied_state:
+            eval_targets.extend(side)
+        return out
+
     if isinstance(c, lm_cache.RotatingKVCache):
         out = type(c)(
             max_size=int(getattr(c, "max_size")),
@@ -276,6 +297,7 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
         c,
         (
             lm_cache.KVCache,
+            lm_cache.QuantizedKVCache,
             lm_cache.RotatingKVCache,
             lm_cache.ChunkedKVCache,
             lm_cache.ArraysCache,
@@ -1355,6 +1377,35 @@ class DiskBlockStore:
             c.offset = off
             eval_targets.extend([k, v])
             return c
+
+        if kind == "quant_kv":
+            try:
+                off = int(metadata.get(f"{prefix}_offset", "0"))
+                gs = int(metadata.get(f"{prefix}_group_size", "64"))
+                bits = int(metadata.get(f"{prefix}_bits", "8"))
+            except (TypeError, ValueError):
+                return None
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                c = lm_cache.QuantizedKVCache(group_size=gs, bits=bits)
+                c.offset = off
+                return c
+            parts = {}
+            for name in ("kq", "ks", "kb", "vq", "vs", "vb"):
+                entry = tensor_entries.get(f"{prefix}_{name}")
+                if entry is None:
+                    return None
+                t = _read_safetensors_tensor(path, data_start, entry)
+                if t is None:
+                    return None
+                parts[name] = t
+                eval_targets.append(t)
+            state = (
+                (parts["kq"], parts["ks"], parts["kb"]),
+                (parts["vq"], parts["vs"], parts["vb"]),
+            )
+            return lm_cache.QuantizedKVCache.from_state(
+                state, (str(off), str(gs), str(bits))
+            )
 
         if kind == "rotating_kv":
             try:
@@ -2490,6 +2541,24 @@ class DiskBlockStore:
                 return True
             arrays[f"{prefix}_k"] = c.keys[..., :off, :]
             arrays[f"{prefix}_v"] = c.values[..., :off, :]
+            return True
+
+        if isinstance(c, lm_cache.QuantizedKVCache):
+            off = int(getattr(c, "offset", 0) or 0)
+            metadata[f"{prefix}_kind"] = "quant_kv"
+            metadata[f"{prefix}_offset"] = str(off)
+            metadata[f"{prefix}_group_size"] = str(int(getattr(c, "group_size", 64)))
+            metadata[f"{prefix}_bits"] = str(int(getattr(c, "bits", 8)))
+            if c.keys is None or off <= 0:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            (kq, ks, kb), (vq, vs, vb) = c.state
+            arrays[f"{prefix}_kq"] = kq
+            arrays[f"{prefix}_ks"] = ks
+            arrays[f"{prefix}_kb"] = kb
+            arrays[f"{prefix}_vq"] = vq
+            arrays[f"{prefix}_vs"] = vs
+            arrays[f"{prefix}_vb"] = vb
             return True
 
         if isinstance(c, lm_cache.RotatingKVCache):
@@ -3636,6 +3705,15 @@ def _merge_exact_cache_entries(
         if any(c is None for c in merged):
             return None
         return lm_cache.CacheList(*merged)
+    if all(isinstance(c, lm_cache.QuantizedKVCache) for c in entries):
+        try:
+            from mlx_vlm.models.cache import BatchQuantizedKVCache
+
+            if hasattr(BatchQuantizedKVCache, "merge"):
+                return BatchQuantizedKVCache.merge(entries)
+        except Exception:
+            pass
+        return None
     return None
 
 
