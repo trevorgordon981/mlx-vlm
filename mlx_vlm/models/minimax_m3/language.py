@@ -156,6 +156,16 @@ class M3Attention(nn.Module):
             o = o[:, :, :L, :].transpose(0, 2, 1, 3).reshape(B, L, -1)
             return self.o_proj(o)
 
+        if (
+            mask is not None
+            and not isinstance(mask, str)
+            and mask.ndim == 4
+            and self.n_heads != self.n_kv
+            and getattr(cache, "bits", None) is not None
+        ):
+            # quantized-KV GQA path: mlx_lm reshapes scores to 5D [B,n_kv,n_repeats,L,L];
+            # lift the 4D [B,1,L,L] mask to [B,1,1,L,L] so it broadcasts (else B vs n_kv clash).
+            mask = mask[:, :, None]
         out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
