@@ -63,7 +63,13 @@ class VisionEmbeddings(nn.Module):
         self.patch_embedding = nn.Conv3d(config.num_channels, config.hidden_size, kernel_size=ks, stride=ks, bias=False)
 
     def __call__(self, x):
-        x = x.reshape(-1, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels)
+        # pixel_values feature order from the image processor is (C, T, ph, pw)
+        # (matches the reference torch Conv3d input layout). MLX Conv3d wants
+        # channels-last (N, T, ph, pw, C), so reshape to the TRUE order first,
+        # then move channels to the last axis. A bare reshape to channels-last
+        # scrambles pixels (scan-lines) and shifts channels (cyan/magenta tinge).
+        x = x.reshape(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
+        x = x.transpose(0, 2, 3, 4, 1)
         x = self.patch_embedding(x)
         return x.reshape(-1, x.shape[-1])
 

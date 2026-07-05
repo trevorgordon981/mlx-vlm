@@ -681,7 +681,12 @@ class GenerationArguments:
 
     def to_template_kwargs(self) -> dict:
         """Convert to kwargs for apply_chat_template()."""
-        kw = {"enable_thinking": self.enable_thinking}
+        kw = {
+            "enable_thinking": self.enable_thinking,
+            # M3 chat_template reads the string `thinking_mode`, not the bool above;
+            # map it so enable_thinking actually controls the template (off => answer directly).
+            "thinking_mode": "enabled" if self.enable_thinking else "disabled",
+        }
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
