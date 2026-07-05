@@ -51,6 +51,14 @@ DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 8
 DEFAULT_PREFILL_BATCH_SIZE = 2
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+# How often (in prefill chunks) to release MLX's buffer cache during chunked
+# prefill. Clearing on every chunk (interval == 1) is an OOM guard but frees
+# buffers that the next equal-sized chunk would immediately re-allocate, so it
+# can throttle prefill throughput (mlx-vlm #945). Interval N clears every N
+# chunks, mirroring the decode loop's periodic `n % 256` clear. Default is 1 to
+# preserve the conservative memory profile; bump via the env var and benchmark
+# on a memory-free box before raising the shipped default.
+DEFAULT_PREFILL_CACHE_CLEAR_INTERVAL = 1
 
 
 def _get_batch_cache_eval_interval() -> int:
@@ -62,6 +70,19 @@ def _get_batch_cache_eval_interval() -> int:
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
         return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+
+
+def _get_prefill_cache_clear_interval() -> int:
+    raw = os.environ.get("MLX_VLM_PREFILL_CACHE_CLEAR_INTERVAL")
+    if raw is None:
+        return DEFAULT_PREFILL_CACHE_CLEAR_INTERVAL
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid MLX_VLM_PREFILL_CACHE_CLEAR_INTERVAL=%r", raw
+        )
+        return DEFAULT_PREFILL_CACHE_CLEAR_INTERVAL
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -411,6 +432,8 @@ def generate_step(
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
             processed_tokens = 0
+            prefill_cache_clear_interval = _get_prefill_cache_clear_interval()
+            chunk_idx = 0
             with tqdm(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
@@ -442,9 +465,14 @@ def generate_step(
                         checkpoint_done = True
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
-                    mx.clear_cache()
+                    chunk_idx += 1
+                    if chunk_idx % prefill_cache_clear_interval == 0:
+                        mx.clear_cache()
                     pbar.update(n_to_process)
 
+            # Always reclaim once before the first decode step, so a throttled
+            # interval never leaves a full chunk's buffers resident going in.
+            mx.clear_cache()
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
