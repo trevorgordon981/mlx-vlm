@@ -15,9 +15,23 @@ _EXTRA_PATTERNS = [
     ("<|START_ACTION|>", "cohere2_moe"),
 ]
 
+# Patterns that must win over mlx_lm's inference. MiniMax-M3 wraps its tool-call
+# XML in the namespace token ']<]minimax[>[' and its template also contains the
+# bare '<tool_call>' substring, which mlx_lm otherwise mis-detects as 'json_tools'
+# (a JSON parser that cannot read M3's XML envelope). Check the distinctive M3
+# marker first so M3 routes to its own parser.
+_PRIORITY_PATTERNS = [
+    ("]<]minimax[>[", "minimax_m3"),
+]
+
 
 def _infer_tool_parser(chat_template):
-    """Infer tool parser type, checking mlx_lm patterns first then extras."""
+    """Infer tool parser type: model-specific overrides, then mlx_lm, then extras."""
+    if isinstance(chat_template, str):
+        for marker, parser_type in _PRIORITY_PATTERNS:
+            if marker in chat_template:
+                return parser_type
+
     result = _mlx_lm_infer_tool_parser(chat_template)
     if result is not None:
         return result
